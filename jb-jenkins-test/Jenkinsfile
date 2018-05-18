@@ -1,0 +1,61 @@
+#!groovy
+
+// Run this node on a Maven Slave
+// Maven Slaves have JDK and Maven already installed
+node('maven-appdev') {
+  // Needed to clone project
+  def sourceUrl = params.PROJECT_SOURCE_URL
+
+  def nexusHostUrl = params.NEXUS_HOST_URL
+
+  def devProject = params.DEV_PROJECT_NAME
+  def prodProject = params.PROD_PROJECT_NAME
+  def majorReleaseNumber = params.MAJOR_RELEASE_NUMBER
+  def jenkinsBuildNumber = "${env.BUILD_NUMBER}"
+
+  // Define Maven Command. Make sure it points to the correct settings for our
+  // Nexus installation. The file nexus_settings.xml needs to be in the
+  // Source Code repository.
+  def mvnCmd = "mvn -s nexus_settings.xml" 
+  def version = "2.0"
+  def serviceName = "mlbparks"
+
+  stage('Print Vars and Test') {
+
+    echo "Print Vars:  Jenkins BUILD_NUMBER = ${jenkinsBuildNumber} "
+    echo "Print Vars:  sourceUrl = ${sourceUrl} "
+    echo "Print Vars:  mvnCmd = ${mvnCmd} "
+    echo "Print Vars:  nexusHostUrl = ${nexusHostUrl} "
+    echo "Print Vars:  devProject = ${devProject} "
+    echo "Print Vars:  prodProject = ${prodProject} "
+    echo "Print Vars:  majorReleaseNumber = ${majorReleaseNumber} "
+    echo "Print Vars:  jenkinsBuildNumber = ${jenkinsBuildNumber} "
+    sh "mvn -v"
+    sh "oc whoami"
+    sh 'if [ -x "$(which docker)" ]; then docker version; else echo docker does not exist; fi'
+    sh 'if [ -x "$(which skopeo)" ]; then skopeo -v; else echo skopeo does not exist; fi'
+
+    //sh "oc patch bc/${serviceName} --patch '{\"spec\": { \"output\": {\"to\": {\"name\": \"${serviceName}:${version}\" }}}}' -n ${devProject}"
+    //sh "oc patch dc/${serviceName} --patch '{\"spec\": { \"template\": {\"spec\": {\"containers\": [{ \"name\":\"${serviceName}\",  \"image\":\"${serviceName}:${version}\" }] }}}}' -n ${devProject}"
+    //sh "oc patch dc/${serviceName} --patch '{\"spec\": { \"triggers\": [{ \"type\": \"ImageChange\", \"imageChangeParams\": { \"containerNames\": [\"${serviceName}\"], \"from\": { \"name\":\"${serviceName}:${version}\" } }}] }}' -n ${devProject}"
+
+    def GREEN = "green"
+    def BLUE = "blue"
+
+    def prodEnv = "oc get routes/parksmap -o template --template {{.spec.to.name}} -n ${prodProject}".execute().text
+    prodEnv = prodEnv.substring(prodEnv.indexOf('-')+ 1)
+    echo "prodEnv = ${prodEnv}"
+
+
+    if(GREEN.equals(prodEnv)) {
+        echo "conditional() prodEnv = ${GREEN}"
+    }else {
+        echo "prodEnv != green.  Instead prodEnv = ${prodEnv}"
+    }
+
+    sh "skopeo --debug inspect --creds=jenkins:`oc whoami -t` --tls-verify=false docker://docker-registry.default.svc:5000/${devProject}/${serviceName}:1-12"
+
+    sh 'while /bin/true; do sleep 30; done'  
+  }
+
+}

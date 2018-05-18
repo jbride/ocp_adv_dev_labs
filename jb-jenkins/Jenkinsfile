@@ -1,0 +1,186 @@
+#!groovy
+
+// Run this node on a Maven Slave
+// Maven Slaves have JDK and Maven already installed
+
+// 'maven' corresponds to Kubernetes Pod Template name specified in Jenkins system configuration
+// Jenkins sys configuration makes use of the "maven" slave image
+node('maven') {
+  // Needed to clone project
+  def sourceUrl = params.PROJECT_SOURCE_URL
+
+  def nexusHostUrl = params.NEXUS_HOST_URL
+
+  def devProject = params.DEV_PROJECT_NAME
+  def prodProject = params.PROD_PROJECT_NAME
+  def majorReleaseNumber = params.MAJOR_RELEASE_NUMBER
+  def jenkinsBuildNumber = "${env.BUILD_NUMBER}"
+
+  // Define Maven Command. Make sure it points to the correct settings for our
+  // Nexus installation. The file nexus_settings.xml needs to be in the
+  // Source Code repository.
+  def mvnCmd = "mvn -s nexus_settings.xml" 
+
+  stage('Print Vars') {
+    echo "Print Vars:  Jenkins BUILD_NUMBER = ${jenkinsBuildNumber} "
+    echo "Print Vars:  sourceUrl = ${sourceUrl} "
+    echo "Print Vars:  mvnCmd = ${mvnCmd} "
+    echo "Print Vars:  nexusHostUrl = ${nexusHostUrl} "
+    echo "Print Vars:  devProject = ${devProject} "
+    echo "Print Vars:  prodProject = ${prodProject} "
+    echo "Print Vars:  majorReleaseNumber = ${majorReleaseNumber} "
+    echo "Print Vars:  jenkinsBuildNumber = ${jenkinsBuildNumber} "
+    sh "mvn -v"
+    sh "oc whoami"
+  }
+
+  stage('Checkout Source') {
+    // Get Source Code from SCM (Git) as configured in the Jenkins Project
+    // Next line for inline script, "checkout scm" for Jenkinsfile from Gogs
+    echo "Checkout Source: sourceUrl = ${sourceUrl} "
+
+    // This clones in working directory
+    git "${sourceUrl}"
+    sh "ls -l "
+  }
+
+  // The following variables need to be defined at the top level and not inside
+  // the scope of a stage - otherwise they would not be accessible from other stages.
+  // Extract version and other properties from the pom.xml
+  def groupId    = getGroupIdFromPom("pom.xml")
+  def artifactId = getArtifactIdFromPom("pom.xml")
+
+  // Using Maven build the war file
+  // Do not run tests in this step
+  stage('Build app') {
+
+    // Increment version of app using maven versions plugin
+    // http://www.mojohaus.org/versions-maven-plugin/set-mojo.html
+    // 
+    sh "${mvnCmd} versions:set -DgenerateBackupPoms=false -DnewVersion=${majorReleaseNumber}-${jenkinsBuildNumber} -DnexusHostUrl=${nexusHostUrl}"
+    
+    echo "Build app: mvnCmd = ${mvnCmd}"
+    sh "${mvnCmd} clean package -DskipTests -DnexusHostUrl=${nexusHostUrl}"
+  }
+
+
+  // Using Maven run the unit tests
+  stage('Unit Tests') {
+    echo "Unit Tests"
+    sh "${mvnCmd} clean test -DnexusHostUrl=${nexusHostUrl}"
+  }
+
+  // Using Maven call SonarQube for Code Analysis
+  stage('Code Analysis') {
+    echo "Code Analysis"
+  }
+
+  // Publish the latest war file to Nexus. This needs to go into <nexusurl>/repository/releases.
+  // Using the properties from the pom.xml file construct a filename that includes the version number from the pom.xml file
+  //
+  // You now have two options: Either binary build (streaming the war file into a binary build) or build with external artifacts.
+  // If you are unclear which path to follow ask your instructor.
+  // 
+  // When doing a binary build you are done.
+  // 
+  // When doing a build with external artifacts (not binary build) you will also need to do the following:
+  // - Update the Gogs project openshift-tasks-ocp by editing the .s2i/environment file. This file needs to have a line
+  //   WAR_FILE_LOCATION=<actual URL of the war file in nexus>
+  // - It is also a good idea to add another line like "BUILD_NUMBER=${BUILD_NUMBER}" to the environment file. Otherwise the
+  //   push to Gig/Gogs will fail in case the version number didn't change. ${BUILD_NUMBER} is one of the Jenkins built-in
+  //   variables.
+  stage('Publish to Nexus') {
+    echo "Publish to Nexus: Will use build with external artifacts approach"
+
+    // https://maven.apache.org/plugins/maven-deploy-plugin/deploy-mojo.html
+    sh "${mvnCmd} deploy -DskipTests -DnexusHostUrl=${nexusHostUrl} -DaltDeploymentRepository=nexus::default::${nexusHostUrl}/repository/releases"
+
+  }
+
+  // Now that source has been compiled, tested and pushed to nexus, determine version
+  def version    = getVersionFromPom("pom.xml")
+
+  stage('Commit version') {
+    echo "Commit version to gogs: version = ${version}"
+
+    // TO-DO: Add /home/jenkins/.gitconfig  as a layer to jenkins slave
+    sh "git config --global user.email \"gpte-jenkins+1@redhat.com\" "
+    sh "git config --global user.name \"gpte-jenkins\" "
+
+    def commitMsg = "Build " + version
+    sh "git add pom.xml && git commit -m \" ${commitMsg} \" && git push origin master"
+  }
+
+  // Build the OpenShift Image in OpenShift. 
+  // 1. When doing a binary build make sure to rename the file ./target/openshift-tasks.war to ROOT.war before you start the build.
+  // 2. When doing a build with external artifacts make sure to use the build configuration pointing to openshift-tasks-ocp
+  //    for the .s2i/bin/assemble script to retrieve the war file from the location in the .s2i/environment file.
+  // Also tag the image with "TestingCandidate-${version}" - e.g. TestingCandidate-1.5
+  stage('Build OpenShift Image') {
+    echo "Build OpenShift Image"
+
+    // 1) Initiate Build (which creates/add to an image stream for this project  in internal OCP registry)
+    sh "oc project ${devProject}"
+    sh "oc set env bc/tasks MVN_TAG=${version}"
+    sh "oc set env bc/tasks NEXUS_HOST_URL=${nexusHostUrl}"
+    sh "oc start-build tasks --follow"
+
+    // 2) tag imagestream latest to this version
+    openshiftTag alias: 'false', destinationNamespace: "${devProject}", namespace: "${devProject}", destStream: 'tasks', destTag: "${version}", srcStream: 'tasks', srcTag: 'latest'
+  }
+
+  // Deploy the built image to the Development Environment. Pay close attention to WHICH image you are deploying.
+  // Make sure it is the one you just tagged in the previous step. You may need to patch the deployment configuration
+  // of your application.
+  stage('Deploy to Dev') {
+    echo "Deploy to Dev"
+
+    sh "oc project ${devProject}"
+    sh "oc patch dc tasks --patch '{\"spec\": { \"triggers\": [ { \"type\": \"ImageChange\", \"imageChangeParams\": { \"containerNames\": [ \"tasks\" ], \"from\": { \"kind\": \"ImageStreamTag\", \"namespace\": \"${devProject}\", \"name\": \"tasks:${version}\"}}}]}}' -n ${devProject}"
+
+    openshiftDeploy depCfg: 'tasks', verbose: 'false', waitTime: '', waitUnit: 'sec', namespace: "${devProject}"
+    //openshiftVerifyDeployment depCfg: 'tasks', namespace: 'xyz-tasks-dev', replicaCount: '1', verbose: 'false', verifyReplicaCount: 'false', waitTime: '', waitUnit: 'sec'
+    //openshiftVerifyService namespace: 'xyz-tasks-dev', svcName: 'tasks', verbose: 'false'
+  }
+
+  // Run some integration tests (see the openshift-tasks Github Repository README.md for ideas).
+  // Once the tests succeed tag the image as ProdReady-${version}
+  stage('Integration Test') {
+    echo "Integration Test"
+  }
+
+  // Blue/Green Deployment into Production
+  // -------------------------------------
+  // Next two stages could be one.
+  // Make sure to deploy the right version. If green is active then deploy blue, and vice versa.
+  // You will need to figure out which application is active and set the target to the other.
+  stage('Prep Production Deployment') {
+    echo "Prep Production Deployment"
+  }
+  // Deploy the ProdReady-${version} image. Make sure this is the actual tagged image deployed!
+  // Do not activate the new version yet.
+  stage('Deploy new Version') {
+    echo "Deploy new Version"
+  }
+
+  // Once approved (input step) switch production over to the new version.
+  stage('Switch over to new Version') {
+    echo "Switch to new Version"
+    input "Switch Production?"
+  }
+}
+
+// Convenience Functions to read variables from the pom.xml
+// Do not change anything below this line.
+def getVersionFromPom(pom) {
+  def matcher = readFile(pom) =~ '<version>(.+)</version>'
+  matcher ? matcher[0][1] : null
+}
+def getGroupIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<groupId>(.+)</groupId>'
+  matcher ? matcher[0][1] : null
+}
+def getArtifactIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<artifactId>(.+)</artifactId>'
+  matcher ? matcher[0][1] : null
+}
